@@ -90,23 +90,40 @@ static const struct reset_control_ops hisi_reset_ops = {
 struct hisi_reset_controller *hisi_reset_init(struct platform_device *pdev)
 {
 	struct hisi_reset_controller *rstc;
+	struct resource *res;
+	int ret;
 
-	rstc = devm_kzalloc_obj(&pdev->dev, *rstc);
+	/* Test reset output */
+	/*pr_err("===> HISI RESET INIT STARTED <===\n");*/
+
+	rstc = devm_kzalloc(&pdev->dev, sizeof(*rstc), GFP_KERNEL);
 	if (!rstc)
 		return NULL;
 
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	//rstc->membase = devm_ioremap_resource(&pdev->dev, res);
 	rstc->membase = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(rstc->membase))
+	if (IS_ERR(rstc->membase)) {
+		pr_err("===> HISI RESET: ioremap failed <===\n");
 		return NULL;
+	}
 
 	spin_lock_init(&rstc->lock);
 	rstc->rcdev.owner = THIS_MODULE;
 	rstc->rcdev.ops = &hisi_reset_ops;
 	rstc->rcdev.of_node = pdev->dev.of_node;
+	//rstc->rcdev.of_args = NULL;
 	rstc->rcdev.of_reset_n_cells = 2;
 	rstc->rcdev.of_xlate = hisi_reset_of_xlate;
-	reset_controller_register(&rstc->rcdev);
+	rstc->rcdev.dev = &pdev->dev;
 
+	ret = reset_controller_register(&rstc->rcdev);
+	if (ret) {
+		pr_err("===> HISI RESET REGISTER FAILED: %d <===\n", ret);
+		return NULL;
+	}
+
+	/*pr_err("===> HISI RESET REGISTER SUCCESSFUL! <===\n");*/
 	return rstc;
 }
 EXPORT_SYMBOL_GPL(hisi_reset_init);

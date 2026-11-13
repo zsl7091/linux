@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * DTS File for HiSilicon Poplar Development Board
+ *
+ * Copyright (c) 2016-2017 HiSilicon Technologies Co., Ltd.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include "hi3798mv300.dtsi"
+
+/ {
+	model = "HiSilicon hi3798mv300 my Development Board";
+	compatible = "hisilicon,hi3798mv300-mybox", "hisilicon,hi3798mv300";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x40000000>;
+	};
+};
+
+&ohci {
+	status = "okay";
+};
+
+&ehci {
+	status = "okay";
+};
+
+&emmc {
+	fifo-depth = <256>;
+	clock-freq-min-max = <12000000 200000000>;
+	cap-mmc-highspeed;
+	no-sd;
+	no-sdio;
+	mmc-hs200-1_8v;
+	//mmc-hs400-1_8v;
+	non-removable;
+	bus-width = <8>;
+	//mmc-ddr-1_8v;
+	/* <sample_deg drive_deg>  对齐 SDK himci_hi3798cv2x */
+	clk-phase-legacy     = <45 180>;
+	clk-phase-mmc-hs     = <45 180>;
+	clk-phase-mmc-ddr52  = <225 90>;   /* 你是 1.8V HS400 路径 */
+	clk-phase-mmc-hs200  = <45 135>;
+	clk-phase-mmc-hs400  = <135 90>;  /* 默认 tuning phase=3 → 135°, drive 90° */
+	hisilicon,sap-dll-reg = <&crg 0x39c>; /* 参数个数以驱动 phandle_args 为准 */
+	status = "okay";
+};
+
+&femac {
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+	gpio-line-names = "GPIO-E",	"",
+			  "",		"",
+			  "",		"GPIO-F",
+			  "",		"GPIO-J";
+};
+
+&gpio2 {
+	status = "okay";
+	gpio-line-names = "GPIO-H",	"GPIO-I",
+			  "GPIO-L",	"GPIO-G",
+			  "GPIO-K",	"",
+			  "",		"";
+};
+
+&gpio3 {
+	status = "okay";
+	gpio-line-names = "",		"",
+			  "",		"",
+			  "GPIO-C",	"",
+			  "",		"GPIO-B";
+};
+
+&gpio4 {
+	status = "okay";
+	gpio-line-names = "",		"",
+			  "",		"",
+			  "",		"GPIO-D",
+			  "",		"";
+};
+
+&gpio5 {
+	status = "okay";
+	gpio-line-names = "",		"USER-LED-1",
+			  "USER-LED-2",	"",
+			  "",		"GPIO-A",
+			  "",		"";
+};
+
+&gpio6 {
+	status = "okay";
+	gpio-line-names = "",		"",
+			  "",		"USER-LED-0",
+			  "",		"",
+			  "",		"";
+};
+
+&i2c0 {
+	status = "okay";
+	label = "LS-I2C0";
+};
+
+/*&i2c2 {
+	status = "okay";
+	label = "LS-I2C1";
+};*/

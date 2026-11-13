@@ -417,6 +417,14 @@ config ARMADA_THERMAL
 	  Enable this option if you want to have support for thermal management
 	  controller present in Marvell EBU Armada SoCs (370,375,XP,38x,7K,8K).
 
+config HI3798_TSENSOR
+	tristate "HiSilicon Hi3798 PMC T-Sensor"
+	depends on ARCH_HISI || ARCH_HISTB || COMPILE_TEST
+	depends on OF
+	help
+	  Support for the on-chip temperature sensor in the PMC block of
+	  HiSilicon Hi3798CV200 / MV200 / MV300 SoCs.
+
 config DA9062_THERMAL
 	tristate "DA9062/DA9061 Dialog Semiconductor thermal driver"
 	depends on MFD_DA9062 || COMPILE_TEST

@@ -30,12 +30,13 @@ struct dw_mci_hi3798mv200_priv {
 	struct clk *drive_clk;
 	struct regmap *crg_reg;
 	u32 sap_dll_offset;
+	struct mmc_clk_phase_map phase_map;
 };
 
 static void dw_mci_hi3798mv200_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 {
 	struct dw_mci_hi3798mv200_priv *priv = host->priv;
-	struct mmc_clk_phase phase = host->phase_map.phase[ios->timing];
+	struct mmc_clk_phase phase = priv->phase_map.phase[ios->timing];
 	u32 val;
 
 	val = mci_readl(host, ENABLE_SHIFT);
@@ -53,15 +54,20 @@ static void dw_mci_hi3798mv200_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 		val &= ~SDMMC_DDR_HS400;
 	mci_writel(host, DDR_REG, val);
 
-	if (clk_set_rate(host->ciu_clk, ios->clock))
-		dev_warn(host->dev, "Failed to set rate to %u\n", ios->clock);
-	else
-		/*
-		 * CLK_MUX_ROUND_NEAREST is enabled for this clock
-		 * The actual clock rate is not what we set, but a rounded value
-		 * so we should get the rate once again
-		 */
+	/*
+	 * For low frequencies (e.g. 400kHz initialization rate), rely on
+	 * DWMMC internal clock dividers instead of reconfiguring the CRG
+	 * clock, as CRG cannot directly supply such low clock rates.
+	 */
+	if (ios->clock >= 1000000) {
+		if (clk_set_rate(host->ciu_clk, ios->clock))
+			dev_warn(host->dev, "Failed to set rate to %u\n", ios->clock);
+		else
+			host->bus_hz = clk_get_rate(host->ciu_clk);
+	} else {
+		/* Keep current ciu_clk rate and leave low-rate division to DWMMC core */
 		host->bus_hz = clk_get_rate(host->ciu_clk);
+	}
 
 	if (phase.valid) {
 		clk_set_phase(priv->drive_clk, phase.out_deg);
@@ -73,6 +79,7 @@ static void dw_mci_hi3798mv200_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 	}
 }
 
+// 1. enable_tuning
 static inline int dw_mci_hi3798mv200_enable_tuning(struct dw_mci *host)
 {
 	struct dw_mci_hi3798mv200_priv *priv = host->priv;
@@ -80,6 +87,7 @@ static inline int dw_mci_hi3798mv200_enable_tuning(struct dw_mci *host)
 	return regmap_clear_bits(priv->crg_reg, priv->sap_dll_offset, SAP_DLL_CTRL_DLLMODE);
 }
 
+// 2. disable_tuning
 static inline int dw_mci_hi3798mv200_disable_tuning(struct dw_mci *host)
 {
 	struct dw_mci_hi3798mv200_priv *priv = host->priv;
@@ -87,15 +95,15 @@ static inline int dw_mci_hi3798mv200_disable_tuning(struct dw_mci *host)
 	return regmap_set_bits(priv->crg_reg, priv->sap_dll_offset, SAP_DLL_CTRL_DLLMODE);
 }
 
-static int dw_mci_hi3798mv200_execute_tuning_mix_mode(struct dw_mci *host,
-					     u32 opcode)
+// 3. execute_tuning_mix_mode
+static int dw_mci_hi3798mv200_execute_tuning_mix_mode(struct dw_mci *host, u32 opcode)
 {
 	static const int degrees[] = { 0, 45, 90, 135, 180, 225, 270, 315 };
 	struct dw_mci_hi3798mv200_priv *priv = host->priv;
 	int raise_point = -1, fall_point = -1, mid;
 	int err, prev_err = -1;
 	int found = 0;
-	int regval;
+	u32 regval;
 	int i;
 	int ret;
 
@@ -108,17 +116,15 @@ static int dw_mci_hi3798mv200_execute_tuning_mix_mode(struct dw_mci *host,
 		mci_writel(host, RINTSTS, ALL_INT_CLR);
 
 		/*
-		 * HiSilicon implemented a tuning mechanism.
-		 * It needs special interaction with the DLL.
-		 *
+		 * We only need to find the rising and falling edges.
 		 * Treat edge(flip) found as an error too.
 		 */
-		err = mmc_send_tuning(host->mmc, opcode, NULL);
+		err = mmc_send_tuning(host->mmc, opcode, NULL);   // ? ????? host->mmc
 		regval = mci_readl(host, TUNING_CTRL);
 		if (err || (regval & SDMMC_TUNING_FIND_EDGE))
 			err = 1;
-		else
-			found = 1;
+    else
+        found = 1;
 
 		if (i > 0) {
 			if (err && !prev_err)
@@ -143,9 +149,9 @@ tuning_out:
 			raise_point = 0;
 		if (fall_point == -1)
 			fall_point = ARRAY_SIZE(degrees) - 1;
+
 		if (fall_point < raise_point) {
-			if ((raise_point + fall_point) >
-			    (ARRAY_SIZE(degrees) - 1))
+			if ((raise_point + fall_point) > (ARRAY_SIZE(degrees) - 1))
 				mid = fall_point / 2;
 			else
 				mid = (raise_point + ARRAY_SIZE(degrees) - 1) / 2;
@@ -157,21 +163,19 @@ tuning_out:
 		 * We don't care what timing we are tuning for,
 		 * simply use the same phase for all timing needs tuning.
 		 */
-		host->phase_map.phase[MMC_TIMING_MMC_HS200].in_deg = degrees[mid];
-		host->phase_map.phase[MMC_TIMING_MMC_HS400].in_deg = degrees[mid];
-		host->phase_map.phase[MMC_TIMING_UHS_SDR104].in_deg = degrees[mid];
+		priv->phase_map.phase[MMC_TIMING_MMC_HS200].in_deg = degrees[mid];
+		priv->phase_map.phase[MMC_TIMING_MMC_HS400].in_deg = degrees[mid];
+		priv->phase_map.phase[MMC_TIMING_UHS_SDR104].in_deg = degrees[mid];
 
 		clk_set_phase(priv->sample_clk, degrees[mid]);
 		dev_dbg(host->dev, "Tuning clk_sample[%d, %d], set[%d]\n",
 			raise_point, fall_point, degrees[mid]);
-		ret = 0;
 	} else {
-		dev_err(host->dev, "No valid clk_sample shift!\n");
-		ret = -EINVAL;
+		dev_err(host->dev, "No valid clk_sample shift! use default\n");
+		err = -EINVAL;
 	}
 
 	mci_writel(host, RINTSTS, ALL_INT_CLR);
-
 	return ret;
 }
 
@@ -180,9 +184,11 @@ static int dw_mci_hi3798mv200_init(struct dw_mci *host)
 	struct dw_mci_hi3798mv200_priv *priv;
 	struct device_node *np = host->dev->of_node;
 
-	priv = devm_kzalloc_obj(host->dev, *priv);
+	priv = devm_kzalloc(host->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+
+	mmc_of_parse_clk_phase(host->dev, &priv->phase_map);
 
 	priv->sample_clk = devm_clk_get_enabled(host->dev, "ciu-sample");
 	if (IS_ERR(priv->sample_clk))

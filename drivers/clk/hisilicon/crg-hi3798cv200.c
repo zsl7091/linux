@@ -151,6 +151,17 @@ static const struct hisi_gate_clock hi3798cv200_gate_clks[] = {
 		CLK_SET_RATE_PARENT, 0xcc, 4, 0, },
 	{ HISTB_ETH1_MACIF_CLK, "clk_macif1", "clk_bus_m1",
 		CLK_SET_RATE_PARENT, 0xcc, 25, 0, },
+	/*
+	 * FEMAC / hieth SF (SDK PERI_CRG52_SF @ 0xD0):
+	 *   enable mask/value = 0x3  → bit0 | bit1
+	 * FEPHY clock @ 0x388 bit0 (SDK phy.c)
+	 */
+	{ HISTB_ETH_SF_CLK, "clk_eth_sf", "clk_ahb",
+		CLK_SET_RATE_PARENT, 0xd0, 0, 0, },
+	{ HISTB_ETH_SF_BUS_CLK, "clk_eth_sf_bus", "clk_ahb",
+		CLK_SET_RATE_PARENT, 0xd0, 1, 0, },
+	{ HISTB_ETH_FEPHY_CLK, "clk_eth_fephy", "clk_osc",
+		CLK_SET_RATE_PARENT, 0x388, 0, 0, },
 	/* COMBPHY0 */
 	{ HISTB_COMBPHY0_CLK, "clk_combphy0", "combphy0_mux",
 		CLK_SET_RATE_PARENT, 0x188, 0, 0, },
@@ -345,7 +356,7 @@ static int hi3798cv200_crg_probe(struct platform_device *pdev)
 {
 	struct hisi_crg_dev *crg;
 
-	crg = devm_kmalloc_obj(&pdev->dev, *crg);
+	crg = devm_kmalloc(&pdev->dev, sizeof(*crg), GFP_KERNEL);
 	if (!crg)
 		return -ENOMEM;
 

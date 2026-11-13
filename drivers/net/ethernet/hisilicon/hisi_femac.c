@@ -10,10 +10,17 @@
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/io.h>
+#include <linux/delay.h>
+#include <linux/bitops.h>
+#include <linux/mii.h>
+#include "festa_s28v112_table.h"
 
 /* MAC control register list */
 #define MAC_PORTSEL			0x0200
@@ -83,10 +90,23 @@
 #define MAX_UNICAST_ADDRESSES		2
 #define MAX_MULTICAST_ADDRESSES		(MAX_MAC_FILTER_NUM - \
 					MAX_UNICAST_ADDRESSES)
+#define CRG_BASE   0xF8A22000
+#define PERI_BASE  0xF8A20000
+#define REG_FEPHY  0x388    /* CRG */
+#define REG_LDO    0x844    /* PERI */
+#define REG_ADDR   0x118    /* PERI */
 /* software tx and rx queue number, should be power of 2 */
 #define TXQ_NUM				64
 #define RXQ_NUM				128
 #define FEMAC_POLL_WEIGHT		16
+
+#define MII_EXPMA               0x1e
+#define MII_EXPMD               0x1d
+#define REG_LD_AM               0x3050
+#define REG_LDO_AM              0x3051
+#define REG_R_TUNING            0x3052
+#define REG_WR_DONE             0x3053
+
 
 #define PHY_RESET_DELAYS_PROPERTY	"hisilicon,phy-reset-delays-us"
 
@@ -95,6 +115,13 @@ enum phy_reset_delays {
 	PULSE,
 	POST_DELAY,
 	DELAYS_NUM,
+};
+
+enum clk_type {
+	CLK_MAC,
+	CLK_MACIF,
+	CLK_PHY,
+	CLK_NUM,
 };
 
 struct hisi_femac_queue {
@@ -108,7 +135,7 @@ struct hisi_femac_queue {
 struct hisi_femac_priv {
 	void __iomem *port_base;
 	void __iomem *glb_base;
-	struct clk *clk;
+	struct clk_bulk_data *clks;
 	struct reset_control *mac_rst;
 	struct reset_control *phy_rst;
 	u32 phy_reset_delays[DELAYS_NUM];
@@ -116,6 +143,7 @@ struct hisi_femac_priv {
 
 	struct device *dev;
 	struct net_device *ndev;
+	struct platform_device *mdio_pdev;
 
 	struct hisi_femac_queue txq;
 	struct hisi_femac_queue rxq;
@@ -348,11 +376,13 @@ static int hisi_femac_init_queue(struct device *dev,
 				 struct hisi_femac_queue *queue,
 				 unsigned int num)
 {
-	queue->skb = devm_kzalloc_objs(dev, struct sk_buff *, num);
+	queue->skb = devm_kcalloc(dev, num, sizeof(struct sk_buff *),
+				  GFP_KERNEL);
 	if (!queue->skb)
 		return -ENOMEM;
 
-	queue->dma_phys = devm_kzalloc_objs(dev, dma_addr_t, num);
+	queue->dma_phys = devm_kcalloc(dev, num, sizeof(dma_addr_t),
+				       GFP_KERNEL);
 	if (!queue->dma_phys)
 		return -ENOMEM;
 
@@ -489,7 +519,6 @@ static int hisi_femac_net_close(struct net_device *dev)
 	netif_stop_queue(dev);
 	napi_disable(&priv->napi);
 
-	hisi_femac_port_reset(priv);
 	hisi_femac_free_skb_rings(priv);
 
 	return 0;
@@ -692,6 +721,7 @@ static const struct net_device_ops hisi_femac_netdev_ops = {
 static void hisi_femac_core_reset(struct hisi_femac_priv *priv)
 {
 	reset_control_assert(priv->mac_rst);
+	usleep_range(200, 300);
 	reset_control_deassert(priv->mac_rst);
 }
 
@@ -711,6 +741,10 @@ static void hisi_femac_sleep_us(u32 time_us)
 
 static void hisi_femac_phy_reset(struct hisi_femac_priv *priv)
 {
+	/* MAC clock must be disabled before PHY reset
+	 */
+	clk_disable(priv->clks[CLK_MAC].clk);
+	clk_disable(priv->clks[CLK_MACIF].clk);
 	/* To make sure PHY hardware reset success,
 	 * we must keep PHY in deassert state first and
 	 * then complete the hardware reset operation
@@ -726,6 +760,9 @@ static void hisi_femac_phy_reset(struct hisi_femac_priv *priv)
 	reset_control_deassert(priv->phy_rst);
 	/* delay some time to ensure later MDIO access */
 	hisi_femac_sleep_us(priv->phy_reset_delays[POST_DELAY]);
+
+	clk_enable(priv->clks[CLK_MAC].clk);
+	clk_enable(priv->clks[CLK_MACIF].clk);
 }
 
 static void hisi_femac_port_init(struct hisi_femac_priv *priv)
@@ -764,14 +801,168 @@ static void hisi_femac_port_init(struct hisi_femac_priv *priv)
 	writel(val, priv->port_base + QLEN_SET);
 }
 
+static void hi3798_fephy_hw_init(struct device *dev, int phy_addr)
+{
+	void __iomem *crg, *peri;
+	u32 val;
+
+	crg = ioremap(CRG_BASE, 0x1000);
+	peri = ioremap(PERI_BASE, 0x1000);
+	if (!crg || !peri) {
+		dev_err(dev, "FEPHY ioremap failed\n");
+		goto out;
+	}
+
+	/* LDO 1.1V style (SDK MV300) */
+	val = readl(peri + REG_LDO);
+	val |= BIT(4) | BIT(6);
+	val &= ~(BIT(5) | BIT(7));
+	writel(val, peri + REG_LDO);
+
+	/* FEPHY clock enable (also via clk framework if possible) */
+	val = readl(crg + REG_FEPHY);
+	val |= BIT(0);
+	writel(val, crg + REG_FEPHY);
+
+	/* PHY address = 2 on your board */
+	val = readl(peri + REG_ADDR);
+	val = (val & ~0x1f) | (phy_addr & 0x1f);
+	writel(val, peri + REG_ADDR);
+
+	/* reset pulse bit4 */
+	val = readl(crg + REG_FEPHY);
+	val |= BIT(4);
+	writel(val, crg + REG_FEPHY);
+	usleep_range(10, 1000);
+
+	val = readl(crg + REG_FEPHY);
+	val &= ~BIT(4);
+	writel(val, crg + REG_FEPHY);
+
+	msleep(20);
+	dev_info(dev, "FEPHY hw init done (addr=%d)\n", phy_addr);
+	dev_info(dev, "FEPHY CRG+0x388=0x%08x PERI+0x118=0x%08x LDO=0x%08x\n",
+		 readl(crg + REG_FEPHY),
+		 readl(peri + REG_ADDR),
+		 readl(peri + REG_LDO));
+
+out:
+	if (crg)
+		iounmap(crg);
+	if (peri)
+		iounmap(peri);
+}
+
+static int hi3798_fephy_exp_write(struct mii_bus *bus, int phy_addr,
+				  u32 reg, u16 val)
+{
+	int ret;
+
+	ret = mdiobus_write(bus, phy_addr, MII_EXPMA, reg);
+	if (ret < 0)
+		return ret;
+	return mdiobus_write(bus, phy_addr, MII_EXPMD, val);
+}
+
+static int hi3798_fephy_exp_read(struct mii_bus *bus, int phy_addr, u32 reg)
+{
+	int ret;
+
+	ret = mdiobus_write(bus, phy_addr, MII_EXPMA, reg);
+	if (ret < 0)
+		return ret;
+	return mdiobus_read(bus, phy_addr, MII_EXPMD);
+}
+
+/* 与 SDK 一致：你板 la_am=0xc, ldo_am=0x4, r_tuning=0x21 */
+static void hi3798_fephy_trim(struct device *dev, struct mii_bus *bus,
+			      int phy_addr)
+{
+	int v;
+	int timeout = 3000;
+
+	if (!bus) {
+		dev_err(dev, "FEPHY trim: no mii_bus\n");
+		return;
+	}
+
+	v = hi3798_fephy_exp_read(bus, phy_addr, REG_LD_AM);
+	if (v < 0)
+		goto read_fail;
+	v = (v & ~0x1f) | 0x0c;
+	hi3798_fephy_exp_write(bus, phy_addr, REG_LD_AM, v);
+
+	v = hi3798_fephy_exp_read(bus, phy_addr, REG_LDO_AM);
+	if (v < 0)
+		goto read_fail;
+	v = (v & ~0x7) | 0x4;
+	hi3798_fephy_exp_write(bus, phy_addr, REG_LDO_AM, v);
+
+	v = hi3798_fephy_exp_read(bus, phy_addr, REG_R_TUNING);
+	if (v < 0)
+		goto read_fail;
+	v = (v & ~0x3f) | 0x21;
+	hi3798_fephy_exp_write(bus, phy_addr, REG_R_TUNING, v);
+
+	v = hi3798_fephy_exp_read(bus, phy_addr, REG_WR_DONE);
+	if (v < 0)
+		goto read_fail;
+	hi3798_fephy_exp_write(bus, phy_addr, REG_WR_DONE, v | BIT(0));
+
+	do {
+		usleep_range(100, 150);
+		v = hi3798_fephy_exp_read(bus, phy_addr, REG_WR_DONE);
+		if (v < 0)
+			goto read_fail;
+	} while (!(v & BIT(1)) && --timeout);
+
+	if (!timeout)
+		dev_warn(dev, "FEPHY trim: wait done timeout\n");
+
+	dev_info(dev, "FEPHY trim: la_am=0x%x ldo_am=0x%x r_tuning=0x%x\n",
+		 hi3798_fephy_exp_read(bus, phy_addr, REG_LD_AM) & 0x1f,
+		 hi3798_fephy_exp_read(bus, phy_addr, REG_LDO_AM) & 0x7,
+		 hi3798_fephy_exp_read(bus, phy_addr, REG_R_TUNING) & 0x3f);
+	return;
+
+read_fail:
+	dev_err(dev, "FEPHY trim: MDIO expanded access failed\n");
+}
+
+static void hi3798_fephy_festa_table(struct device *dev, struct mii_bus *bus,
+				     int phy_addr)
+{
+	int i, ret;
+
+	if (!bus) {
+		dev_err(dev, "FEPHY festa: no mii_bus\n");
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(festa_s28v112_table); i++) {
+		ret = hi3798_fephy_exp_write(bus, phy_addr,
+					     festa_s28v112_table[i].reg,
+					     festa_s28v112_table[i].val);
+		if (ret < 0) {
+			dev_err(dev, "FEPHY festa: fail at [%d] reg=0x%x\n",
+				i, festa_s28v112_table[i].reg);
+			return;
+		}
+	}
+
+	dev_info(dev, "FEPHY festa table applied (%u entries)\n",
+		 (unsigned)ARRAY_SIZE(festa_s28v112_table));
+}
+
 static int hisi_femac_drv_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *node = dev->of_node;
+	struct device_node *node = dev->of_node, *mdio_np;
 	struct net_device *ndev;
 	struct hisi_femac_priv *priv;
 	struct phy_device *phy;
 	int ret;
+	bool mdio_registered = false;
 
 	ndev = alloc_etherdev(sizeof(*priv));
 	if (!ndev)
@@ -796,17 +987,16 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
 		goto out_free_netdev;
 	}
 
-	priv->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(priv->clk)) {
-		dev_err(dev, "failed to get clk\n");
-		ret = -ENODEV;
+	ret = devm_clk_bulk_get_all(&pdev->dev, &priv->clks);
+	if (ret < 0 || ret != CLK_NUM) {
+		dev_err(dev, "failed to get clk bulk: %d\n", ret);
 		goto out_free_netdev;
 	}
 
-	ret = clk_prepare_enable(priv->clk);
+	ret = clk_bulk_prepare_enable(CLK_NUM, priv->clks);
 	if (ret) {
-		dev_err(dev, "failed to enable clk %d\n", ret);
-		goto out_free_netdev;
+		dev_err(dev, "failed to enable clk bulk: %d\n", ret);
+		goto out_disable_clk;
 	}
 
 	priv->mac_rst = devm_reset_control_get(dev, "mac");
@@ -829,13 +1019,56 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
 		hisi_femac_phy_reset(priv);
 	}
 
-	ndev->netdev_ops = &hisi_femac_netdev_ops;
+	hi3798_fephy_hw_init(dev, 2);
+	mdelay(5);
 
+	// Register the optional MDIO bus
+	for_each_available_child_of_node(node, mdio_np) {
+		if (of_node_name_prefix(mdio_np, "mdio")) {
+			priv->mdio_pdev = of_platform_device_create(mdio_np, NULL, dev);
+			of_node_put(mdio_np);
+			if (!priv->mdio_pdev) {
+				dev_err(dev, "failed to register MDIO bus device\n");
+				ret = -ENODEV;
+				goto out_disable_clk;
+			}
+			mdio_registered = true;
+			break;
+		}
+	}
+
+	if (!mdio_registered)
+		dev_warn(dev, "MDIO subnode not found. This is usually a bug.\n");
+		/* MDIO 已注册之后、connect 之前做 trim */
+	    if (priv->mdio_pdev) {
+		struct mii_bus *bus = platform_get_drvdata(priv->mdio_pdev);
+
+		hi3798_fephy_trim(dev, bus, 2);
+		mdelay(5);
+
+		hi3798_fephy_festa_table(dev, bus, 2);
+		mdelay(5);
+
+		int id1 = mdiobus_read(bus, 2, MII_PHYSID1);
+		int id2 = mdiobus_read(bus, 2, MII_PHYSID2);
+		struct phy_device *p;
+
+		if (id1 >= 0 && id2 >= 0) {
+			p = mdiobus_get_phy(bus, 2);
+		    if (p) {
+			p->phy_id = ((id1 & 0xffff) << 16) | (id2 & 0xffff);
+			dev_info(dev,
+			"FEPHY phy_id updated to 0x%08x\n",
+			p->phy_id);
+		    }
+		}
+	    }
 	phy = of_phy_get_and_connect(ndev, node, hisi_femac_adjust_link);
+
 	if (!phy) {
 		dev_err(dev, "connect to PHY failed!\n");
 		ret = -ENODEV;
-		goto out_disable_clk;
+		goto out_unregister_mdio_bus;
 	}
 
 	phy_attached_print(phy, "phy_id=0x%.8lx, phy_mode=%s\n",
@@ -851,6 +1084,7 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
 
 	ndev->watchdog_timeo = 6 * HZ;
 	ndev->priv_flags |= IFF_UNICAST_FLT;
+	ndev->netdev_ops = &hisi_femac_netdev_ops;
 	ndev->ethtool_ops = &hisi_femac_ethtools_ops;
 	netif_napi_add_weight(ndev, &priv->napi, hisi_femac_poll,
 			      FEMAC_POLL_WEIGHT);
@@ -885,8 +1119,13 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
 out_disconnect_phy:
 	netif_napi_del(&priv->napi);
 	phy_disconnect(phy);
+out_unregister_mdio_bus:
+	if (priv->mdio_pdev) {
+		platform_device_unregister(priv->mdio_pdev);
+		priv->mdio_pdev = NULL;
+	}
 out_disable_clk:
-	clk_disable_unprepare(priv->clk);
+	clk_bulk_disable_unprepare(CLK_NUM, priv->clks);
 out_free_netdev:
 	free_netdev(ndev);
 
@@ -898,11 +1137,18 @@ static void hisi_femac_drv_remove(struct platform_device *pdev)
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct hisi_femac_priv *priv = netdev_priv(ndev);
 
-	netif_napi_del(&priv->napi);
 	unregister_netdev(ndev);
+	netif_napi_del(&priv->napi);
 
-	phy_disconnect(ndev->phydev);
-	clk_disable_unprepare(priv->clk);
+	if (ndev->phydev)
+		phy_disconnect(ndev->phydev);
+
+	if (priv->mdio_pdev) {
+		platform_device_unregister(priv->mdio_pdev);
+		priv->mdio_pdev = NULL;
+	}
+
+	clk_bulk_disable_unprepare(CLK_NUM, priv->clks);
 	free_netdev(ndev);
 }
 
@@ -919,7 +1165,7 @@ static int hisi_femac_drv_suspend(struct platform_device *pdev,
 		netif_device_detach(ndev);
 	}
 
-	clk_disable_unprepare(priv->clk);
+	clk_bulk_disable_unprepare(CLK_NUM, priv->clks);
 
 	return 0;
 }
@@ -928,8 +1174,14 @@ static int hisi_femac_drv_resume(struct platform_device *pdev)
 {
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct hisi_femac_priv *priv = netdev_priv(ndev);
+	int ret;
 
-	clk_prepare_enable(priv->clk);
+	ret = clk_bulk_prepare_enable(CLK_NUM, priv->clks);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to enable clk bulk: %d\n", ret);
+		return ret;
+	}
+
 	if (priv->phy_rst)
 		hisi_femac_phy_reset(priv);
 
@@ -945,8 +1197,7 @@ static int hisi_femac_drv_resume(struct platform_device *pdev)
 #endif
 
 static const struct of_device_id hisi_femac_match[] = {
-	{.compatible = "hisilicon,hisi-femac-v1",},
-	{.compatible = "hisilicon,hisi-femac-v2",},
+	{.compatible = "hisilicon,hi3798mv200-femac",},
 	{.compatible = "hisilicon,hi3516cv300-femac",},
 	{},
 };
@@ -971,4 +1222,3 @@ module_platform_driver(hisi_femac_driver);
 MODULE_DESCRIPTION("Hisilicon Fast Ethernet MAC driver");
 MODULE_AUTHOR("Dongpo Li <lidongpo@hisilicon.com>");
 MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:hisi-femac");

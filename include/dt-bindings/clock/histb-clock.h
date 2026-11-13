@@ -58,6 +58,10 @@
 #define HISTB_USB3_UTMI_CLK1		48
 #define HISTB_USB3_PIPE_CLK1		49
 #define HISTB_USB3_SUSPEND_CLK1		50
+/* Hi3798MV200/MV300 FEMAC (SF @ CRG 0xD0, FEPHY @ 0x388) */
+#define HISTB_ETH_SF_CLK		51	/* CRG+0xD0 bit0 */
+#define HISTB_ETH_SF_BUS_CLK		52	/* CRG+0xD0 bit1 */
+#define HISTB_ETH_FEPHY_CLK		53	/* CRG+0x388 bit0 */
 
 /* clocks provided by mcu CRG */
 #define HISTB_MCE_CLK			1
